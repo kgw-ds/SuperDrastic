@@ -72,6 +72,9 @@
 #ifdef BANANADS_GENGIS
 #include "gengis_renderer.h"
 #endif
+#ifdef BANANADS_2D
+#include "GPU2D_Banana.h"  // (melonDS::BananaGrid4On; without Gengis nothing else brings it: the PC build)
+#endif
 #include "cheats.h"
 #include "screenshot.h"
 #include "menu.h"
