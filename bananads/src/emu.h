@@ -98,6 +98,10 @@ public:
     int audio(int16_t* stereo, int max_frames);  // what the SPU made since the last call
     void set_audio_rate(double hz);              // the SPU's output rate (48000: the DS's speed; kms.pace=display)
     int audio_backlog() const;                   // what the SPU made and audio() hasn't read yet, in stereo frames
+    // the sound clock (melonDS patch 0500, kms.ff_music): the ARM7's timers and the SPU at `rate` of the game's time
+    // (1/N fast-forwarded N times: the music keeps its tempo and pitch; 1: the hardware). Between frames, emulator's
+    // thread; kept for a console made again (restart). Returns the rate in effect: 1 on a DSi, which isn't on it
+    double set_sound_clock(double rate);
     // the sound's speed against the game's (audio.servo): below 1 stretches it (more samples per emulated second);
     // any thread may ask, the emulator's thread applies it between frames (never inside the SPU's mix)
     void set_audio_skew(double s) { skew_req_.store(s, std::memory_order_relaxed); }
@@ -174,6 +178,7 @@ private:
     bool lid_closed_ = false;  // the lid as set_lid last had it (emulator thread)
     uint32_t bank3d_ = 0;
     double skew_cur_ = 1.0;
+    double sound_clock_ = -1;  // set_sound_clock's rate (-1: none asked yet, core.sound_clock's at the setup)
     std::vector<int16_t> tap_;  // audio.tap: the mixer's 32768 Hz output (melonDS patch 0180), written at the quit
     std::string tap_path_;
     Config cfg_;

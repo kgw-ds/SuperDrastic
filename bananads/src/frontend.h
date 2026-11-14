@@ -31,6 +31,8 @@ void alsa_ui_load(Alsa* a, int id, const int16_t* pcm, int frames, int rate, int
 void alsa_ui_play(Alsa* a, int id);
 void alsa_stop(Alsa* a);
 void alsa_mute(Alsa* a, bool on);
+// the backlog the rate servo holds (audio.servo_target, stereo frames), or 0 without the servo (audio.servo=off)
+int alsa_servo_target(const Alsa* a);
 // (kms.lowlat_trace) the sound thread's backlog (stereo frames queued ahead of ALSA, the stretch's included) and tempo x 1000
 extern std::atomic<int> g_audio_backlog, g_audio_tempo;  // the game's sound faded out (fast-forward: sped-up sound is chopped noise), or back
 #endif

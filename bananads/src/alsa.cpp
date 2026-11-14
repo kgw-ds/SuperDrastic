@@ -415,6 +415,8 @@ Alsa* alsa_start(Emu& emu, const Config& cfg) {
     return a;
 }
 
+int alsa_servo_target(const Alsa* a) { return a && a->servo ? a->servo_target : 0; }
+
 void alsa_mute(Alsa* a, bool on) {
     if (!a || a->mute.exchange(on) == on) return;
     Log(LogLevel::Info, "[alsa] game sound %s\n", on ? "faded out (fast-forward)" : "back");

@@ -1,0 +1,222 @@
+From 77aabcc9a1c271cfa687007cbac2fcfaa2347b2e Mon Sep 17 00:00:00 2001
+From: kgw-ds <kgw-ds@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:42:16 +0900
+Subject: [PATCH] NDS, SPU: a sound clock, the music at its own speed while
+ fast-forwarding
+
+NDS::SetSoundClockRate(rate): the ARM7's four timers and the SPU run at
+rate of emulated time while everything else keeps the console's clock.
+DS games play their music on the ARM7: a periodic alarm on its timers
+steps the SDK's sequencer and the SPU plays the notes. Fast-forwarded N
+times with rate 1/N, music and sound effects keep their own tempo and
+pitch. The idea is Ssncdevelop/melonDS's keep-music-speed (melonDS 1.1,
+GPL-3.0-or-later), ported onto BananaDS's FastTimers and FastMix.
+
+- RunTimer: an ARM7 timer counts (cycles << CycleShift) * rate, its
+  16.16 remainder kept per timer, so runs of any length add up to the
+  same count. FastTimers' TimerNextUpdate takes the fewest cycles whose
+  scaled count reaches the overflow: exact, as before.
+- SPU::Mix: a Mix runs round(its cycles * rate) SPU cycles for the
+  channels, the capture units, the microphone and the output timeline,
+  the same count every Mix, so FastMix keeps skipping (MixChannelsFast
+  already brings its skipped channels up to date when the count
+  changes). Mixes still come every MixInterval system cycles.
+- The rate is quantized to whole SPU cycles per Mix and the timers take
+  that rate, so the sequencer and the SPU keep one clock.
+- 1.0 is the hardware and the code paths are melonDS's (one untaken
+  branch). A DSi stays at 1.0: its DSP sound isn't on this clock.
+---
+ src/NDS.cpp | 46 ++++++++++++++++++++++++++++++++++++++++++++--
+ src/NDS.h   | 10 ++++++++++
+ src/SPU.cpp | 28 ++++++++++++++++++++++++++++
+ src/SPU.h   |  8 ++++++++
+ 4 files changed, 90 insertions(+), 2 deletions(-)
+
+diff --git a/src/NDS.cpp b/src/NDS.cpp
+index e0ba3ab..51cb19c 100644
+--- a/src/NDS.cpp
++++ b/src/NDS.cpp
+@@ -20,6 +20,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <inttypes.h>
++#include <algorithm>
+ #include "NDS.h"
+ #include "ARMJIT_Stats.h"
+ #include "ARM.h"
+@@ -558,6 +559,7 @@ void NDS::Reset()
+     TimerNext[0] = 0;
+     TimerNext[1] = 0;
+     TimerNextMin = 0;
++    for (u32& frac : SoundClockFrac) frac = 0; // (the rate is the frontend's and stays)
+ 
+     for (i = 0; i < 8; i++) DMAs[i].Reset();
+     memset(DMA9Fill, 0, 4*4);
+@@ -2506,7 +2508,16 @@ void NDS::RunTimer(u32 tid, s32 cycles)
+ {
+     Timer* timer = &Timers[tid];
+ 
+-    timer->Counter += (cycles << timer->CycleShift);
++    if (tid >= 4 && SoundClockRate != 0x10000) [[unlikely]]
++    {
++        // sound clock (SetSoundClockRate): an ARM7 timer counts rate x its cycles, the remainder kept for the next
++        // run, so runs of any lengths add up to the same count (FastTimers' catch-ups included)
++        const u64 scaled = ((u64)(u32)cycles << timer->CycleShift) * SoundClockRate + SoundClockFrac[tid - 4];
++        timer->Counter += (u32)(scaled >> 16);
++        SoundClockFrac[tid - 4] = (u32)scaled & 0xFFFF;
++    }
++    else
++        timer->Counter += (cycles << timer->CycleShift);
+     while (timer->Counter >> 26)
+     {
+         timer->Counter -= (1 << 26);
+@@ -2550,7 +2561,19 @@ void NDS::TimerNextUpdate(u32 cpu) noexcept
+         const Timer& timer = Timers[(cpu << 2) + i];
+         u64 due = base;
+         if (timer.Counter < (1u << 26))
+-            due += (((1u << 26) - timer.Counter) + (1u << timer.CycleShift) - 1) >> timer.CycleShift;
++        {
++            const u32 need = (1u << 26) - timer.Counter;
++            if (cpu == 1 && SoundClockRate != 0x10000) [[unlikely]]
++            {
++                // sound clock: the fewest cycles c whose scaled count, ((c << CycleShift) * rate + remainder) >> 16
++                // as RunTimer adds it, reaches need
++                const u64 num = ((u64)need << 16) - SoundClockFrac[i];
++                const u64 den = (u64)SoundClockRate << timer.CycleShift;
++                due += (num + den - 1) / den;
++            }
++            else
++                due += (need + (1u << timer.CycleShift) - 1) >> timer.CycleShift;
++        }
+         if (due < next)
+             next = due;
+     }
+@@ -2558,6 +2581,25 @@ void NDS::TimerNextUpdate(u32 cpu) noexcept
+     TimerNextMin = std::min(TimerNext[0], TimerNext[1]);
+ }
+ 
++double NDS::SetSoundClockRate(double rate)
++{
++    u32 fixed = 0x10000;
++    if (ConsoleType == 0 && rate < 1.0)
++        fixed = (u32)std::clamp(rate * 65536.0 + 0.5, 1024.0, 65536.0);
++    // whole SPU cycles per Mix (so FastMix keeps skipping); the timers take the same rate
++    fixed = SPU.SetClockRate(fixed);
++    if (fixed != SoundClockRate)
++    {
++        RunTimers(1); // the ARM7's timers up to now at the old rate
++        SoundClockRate = fixed;
++        if (fixed == 0x10000)
++            for (u32& frac : SoundClockFrac) frac = 0;
++        if (FastTimers)
++            TimerNextUpdate(1);
++    }
++    return SoundClockRate / 65536.0;
++}
++
+ const s32 TimerPrescaler[4] = {0, 6, 8, 10};
+ 
+ u16 NDS::TimerGetCounter(u32 timer)
+diff --git a/src/NDS.h b/src/NDS.h
+index ad66436..a1f17df 100644
+--- a/src/NDS.h
++++ b/src/NDS.h
+@@ -300,6 +300,14 @@ public: // TODO: Encapsulate the rest of these members
+     // earliest overflow of its counting timers (RunTimer is additive, so the counters catch up then; every read of a
+     // counter goes through RunTimers first). Off: TimerNext stays 0, and the timers run every slice as melonDS's.
+     void SetFastTimers(bool on) noexcept { FastTimers = on; TimerNext[0] = TimerNext[1] = TimerNextMin = 0; }
++    // Sound clock (BananaDS, kms.ff_music): the ARM7's four timers (they drive the SDK's sound alarm, and so the
++    // sequencer) and the SPU (channels, capture, the microphone's clock, the output's timeline) run at `rate` of
++    // emulated time; everything else keeps the console's clock. Fast-forwarded N times with rate 1/N, a game's music
++    // and sound effects keep their own tempo and pitch. 1.0 is the hardware (the code paths are melonDS's then).
++    // From 1/64 to 1, quantized to whole SPU cycles per Mix so the timers and the SPU keep one clock; a DS only (a
++    // DSi's DSP sound isn't on this clock: 1.0 there). Returns the rate in effect. Between frames, emulator thread.
++    double SetSoundClockRate(double rate);
++    double GetSoundClockRate() const noexcept { return SoundClockRate / 65536.0; }
+     // FastLoop (exact, BananaDS; needs FastSched): RunFrame's loop for the JIT with NextTarget, RunSystem's
+     // early-out, GPU3D::Run's idle case, a halted CPU and Execute's block loop inline (RunSlicesJIT).
+     void SetFastLoop(bool on) noexcept { FastLoop = on; SliceChainOK = FastLoop && FastSched; }
+@@ -821,6 +829,8 @@ protected:
+     u64 TimerNext[2] = {0, 0}; // RunFrame skips RunTimers(cpu) while the CPU's time is below this (FastTimers)
+     u64 TimerNextMin = 0; // the lower of the two
+     void TimerNextUpdate(u32 cpu) noexcept;
++    u32 SoundClockRate = 0x10000; // SetSoundClockRate's rate, 16.16 (0x10000: the hardware)
++    u32 SoundClockFrac[4] = {};   // each ARM7 timer's remainder of its scaled count (16.16's fraction)
+     bool FastLoop = false;
+     bool HaltSkip = false;
+     bool SliceChainOK = false; // FastLoop && FastSched: RunSlicesJIT is the loop SliceChain9 stands in for
+diff --git a/src/SPU.cpp b/src/SPU.cpp
+index fa9a130..b2e3015 100644
+--- a/src/SPU.cpp
++++ b/src/SPU.cpp
+@@ -326,6 +326,22 @@ void SPU::SetSampleRate(AudioSampleRate rate)
+     memset(OutputLastSamples, 0, sizeof(OutputLastSamples));
+     FastDirty = true;
+     FastTailValid = false;
++    ClockIn = ~0u; // (the sound clock's count per Mix, made again for the new length)
++}
++
++u32 SPU::SetClockRate(u32 rate)
++{
++    // the count per Mix (MixInterval system cycles are MixInterval / 2 SPU cycles), at least 1, and the rate it is
++    const u32 len = MixInterval >> 1;
++    u32 count = len ? (u32)(((u64)len * rate + 0x8000) >> 16) : len;
++    if (count < 1) count = 1;
++    const u32 eff = (rate >= 0x10000 || count >= len) ? 0x10000 : (u32)((((u64)count << 16) + len / 2) / len);
++    if (eff != ClockRate)
++    {
++        ClockRate = eff;
++        ClockIn = ~0u;
++    }
++    return ClockRate;
+ }
+ 
+ 
+@@ -1223,6 +1239,18 @@ bool SPU::MixChannelsFast(u32 spucycles, s32& left, s32& right, s32& ch1, s32& c
+ 
+ void SPU::Mix(u32 spucycles)
+ {
++    // sound clock (SetClockRate): this Mix runs fewer SPU cycles, and everything below takes that count (a change of
++    // count is one MixChannelsFast already handles: it brings the skipped channels up to date first)
++    if (ClockRate != 0x10000) [[unlikely]]
++    {
++        if (spucycles != ClockIn)
++        {
++            ClockIn = spucycles;
++            ClockOut = spucycles ? std::max<u32>(1, (u32)(((u64)spucycles * ClockRate + 0x8000) >> 16)) : 0;
++        }
++        spucycles = ClockOut;
++    }
++
+     s32 left = 0, right = 0;
+     s32 leftoutput = 0, rightoutput = 0;
+     s32 ch1 = 0, ch3 = 0;
+diff --git a/src/SPU.h b/src/SPU.h
+index 6553b61..557201d 100644
+--- a/src/SPU.h
++++ b/src/SPU.h
+@@ -256,6 +256,12 @@ public:
+ 
+     void Mix(u32 spucycles);
+ 
++    // Sound clock (BananaDS, NDS::SetSoundClockRate): a Mix runs round(its cycles x rate) SPU cycles (16.16, 0x10000:
++    // the hardware) for the channels, the capture units, the microphone and the output, the same count every Mix so
++    // FastMix keeps skipping. Mixes still come every MixInterval system cycles. Returns the rate in effect: the
++    // count per Mix over the Mix's cycles (1.0 when the count would be the whole Mix).
++    u32 SetClockRate(u32 rate);
++
+     // FastMix (BananaDS, exact): channels whose output can't have changed since the last Mix aren't run again,
+     // the mixers sum with NEON, sound DMA and capture access main RAM directly. Off by default.
+     void SetFastMix(bool enable);
+@@ -306,6 +312,8 @@ private:
+     s16 OutputLastSamples[2];
+ 
+     u32 MixInterval;
++    u32 ClockRate = 0x10000;     // SetClockRate's rate in effect (16.16)
++    u32 ClockIn = 0, ClockOut = 0; // the last Mix length scaled, and its scaled count
+ 
+     Platform::Mutex* AudioLock;
+ 
+-- 
+2.49.0.windows.1
+

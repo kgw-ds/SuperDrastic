@@ -66,6 +66,7 @@
 
 #include "Platform.h"
 #include "cpugov.h"
+#include "ffmusic.h"
 #include "ffspeed.h"
 #include "frontend.h"
 #ifdef BANANADS_GENGIS
@@ -2228,6 +2229,11 @@ int run_kms(Emu& emu, const Config& cfg) {
         for (const KmsPress& p : script) script_end = std::max(script_end, p.at + p.len);
         if (!script.empty()) Log(LogLevel::Info, "[kms] kms.input: %zu presses, to frame %ld\n", script.size(), script_end);
         const bool ff_mute = cfg.flag("kms.ff_mute", true);
+        // kms.ff_music (on): while fast-forwarding, the music and the sound effects at their own speed and pitch (the
+        // sound clock, ffmusic.h), not faded out (kms.ff_mute) or sped up. A DS only: a DSi's sound isn't on it
+        [[maybe_unused]] const bool ff_music = cfg.flag("kms.ff_music", true) && !emu.is_dsi();
+        bool music_on = false;  // the sound clock follows the fast-forward now
+        [[maybe_unused]] FfMusic ffm;
         // kms.lowlat: the deadline the next frame aims at (0: none yet), and kms.lowlat_pad_us on top of the frames'
         // measured times (decaying maxima, Display::emu_us and pres_us)
         long long aim = 0;
@@ -2286,9 +2292,14 @@ int run_kms(Emu& emu, const Config& cfg) {
                 ff = f;
                 pace.set_speed(ff ? ff : 1);  // (Max: 99 times as often, i.e. no wait at all in practice)
 #ifdef BANANADS_ALSA
-                alsa_mute(snd, ff && ff_mute);  // kms.ff_mute (on): no chopped sound while fast-forwarding
+                music_on = ff && ff_music;
+                if (music_on) ffm.start(ff);
+                else emu.set_sound_clock(1.0);  // (the hardware's clock again: the sound goes on where it was)
+                // kms.ff_mute (on): no chopped sound while fast-forwarding, unless kms.ff_music keeps it at its speed
+                alsa_mute(snd, ff && ff_mute && !music_on);
 #endif
-                Log(LogLevel::Info, "[kms] fast-forward %s\n", ff ? (ff == 99 ? "max" : ff == 2 ? "2x" : "3x") : "off");
+                Log(LogLevel::Info, "[kms] fast-forward %s%s\n", ff ? (ff == 99 ? "max" : ff == 2 ? "2x" : "3x") : "off",
+                    music_on ? ", the music at its own speed (kms.ff_music)" : "");
             }
             if (!script.empty() && emu_frames <= script_end) {
                 uint32_t keys = 0;
@@ -2354,6 +2365,12 @@ int run_kms(Emu& emu, const Config& cfg) {
                 else if (on16) emu.draw_into(dp.map16(0, s), dp.map16(1, s));
                 else emu.draw_into(dp.map(0, s), dp.map(1, s));
             }
+#ifdef BANANADS_ALSA
+            // kms.ff_music: the sound clock for this frame, from the speed reached and the sound queued
+            if (music_on && ffm.frame(t_start, period.count() / 1000.0, g_audio_backlog.load(std::memory_order_relaxed),
+                                      alsa_servo_target(snd)))
+                emu.set_sound_clock(ffm.rate());
+#endif
             if (!emu_frames++) start_mark("first frame: start");
             emu.run_frame();
             if (ra_n && emu_frames > 60) {   // (not the load's first frames; a stall isn't a frame's cost)

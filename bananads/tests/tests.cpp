@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "config.h"
+#include "ffmusic.h"
 #include "ffspeed.h"
 #include "mic.h"
 #include "wifi.h"
@@ -194,12 +195,70 @@ static void test_ff_speed() {
     CHECK(ff_speed_of("fast") == 2);
 }
 
+// kms.ff_music's sound clock (ffmusic.h): frames n times as fast as the pacer's period give 1/n, the backlog's nudge
+// goes the right way, a pause doesn't count, Max follows the speed reached, and small moves aren't sent
+static void test_ff_music() {
+    const double period = 16715.18;  // us, a DS frame
+    auto run = [&](FfMusic& m, int speed, double reached, int backlog, int target, int frames, long long& t) {
+        m.start(speed);
+        for (int i = 0; i < frames; i++) {
+            m.frame(t, period, backlog, target);
+            t += std::llround(period / reached);
+        }
+    };
+    long long t = 1000000;
+    {
+        FfMusic m;  // 2x reached, the backlog on its target: 1/2
+        run(m, 2, 2.0, 2880, 2880, 300, t);
+        CHECK(std::fabs(m.rate() - 0.5) < 0.5 * 0.005);
+    }
+    {
+        FfMusic m;  // 3x asked, 1.5x reached (a heavy game): the speed reached, 1/1.5
+        run(m, 3, 1.5, 2880, 2880, 600, t);
+        CHECK(std::fabs(m.rate() - 1 / 1.5) < (1 / 1.5) * 0.01);
+    }
+    {
+        FfMusic m;  // Max reaching 4.5x: 1/4.5
+        run(m, 99, 4.5, 2880, 2880, 600, t);
+        CHECK(std::fabs(m.rate() - 1 / 4.5) < (1 / 4.5) * 0.01);
+    }
+    {
+        FfMusic hi, lo;  // too much queued: less sound per frame (a lower rate); too little: more
+        run(hi, 2, 2.0, 2 * 2880, 2880, 300, t);
+        run(lo, 2, 2.0, 0, 2880, 300, t);
+        CHECK(hi.rate() < 0.5 && hi.rate() > 0.5 / 1.3);
+        CHECK(lo.rate() > 0.5 && lo.rate() < 0.5 / 0.7);
+    }
+    {
+        FfMusic m;  // no servo (target 0): the speed alone; never above 1 (the game below full speed)
+        run(m, 2, 0.8, 0, 0, 300, t);
+        CHECK(m.rate() > 0.995 && m.rate() <= 1.0);  // (within the 0.4% it doesn't send)
+    }
+    {
+        FfMusic m;  // a 2 s pause (the menu) isn't a speed: still 1/2 after it
+        run(m, 2, 2.0, 2880, 2880, 300, t);
+        t += 2000000;
+        m.frame(t, period, 2880, 2880);
+        CHECK(std::fabs(m.rate() - 0.5) < 0.5 * 0.005);
+        // ...and a move under 0.4% isn't sent
+        t += std::llround(period / 2.0);
+        CHECK(!m.frame(t, period, 2880 + 20, 2880));
+    }
+    {
+        FfMusic m;  // the first frame sends a rate at once
+        m.start(2);
+        CHECK(m.frame(t, period, 2880, 2880));
+        CHECK(m.rate() > 0 && m.rate() <= 1.0);
+    }
+}
+
 int main() {
     test_config();
     test_wifi_names();
     test_dns_frames();
     test_mic();
     test_ff_speed();
+    test_ff_music();
     if (fails) {
         fprintf(stderr, "%d check(s) failed\n", fails);
         return 1;

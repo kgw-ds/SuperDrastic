@@ -8,8 +8,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -1151,6 +1153,10 @@ bool Emu::load_rom(const std::string& path) {
     // the JIT with the common cases inline, used with core.fast_sched (patch 0009; both exact, default on)
     nds_->SetFastTimers(cfg_.flag("core.fast_timers", true));
     nds_->SetFastLoop(cfg_.flag("core.fast_loop", true));
+    // the sound clock (melonDS patch 0500; kms.ff_music sets it while fast-forwarding): the rate asked for last, or
+    // core.sound_clock (for the tests: a fixed rate from the start, 1 = the hardware) before anything asked
+    if (sound_clock_ < 0) sound_clock_ = std::clamp(atof(cfg_.str("core.sound_clock", "1").c_str()), 1.0 / 64, 1.0);
+    sound_clock_ = nds_->SetSoundClockRate(sound_clock_);
     // core.halt_skip: with both CPUs halted and nothing to wake them, the slice loop takes the times straight to the
     // next event or timer instead of slice by slice (melonDS patch 0031; exact, default on; with core.fast_loop)
     nds_->SetHaltSkip(cfg_.flag("core.halt_skip", true));
@@ -1595,6 +1601,12 @@ const uint32_t* Emu::bottom() const {
 
 void Emu::set_audio_rate(double hz) {
     if (nds_) nds_->SPU.SetOutputSampleRate(hz);
+}
+
+double Emu::set_sound_clock(double rate) {
+    if (!(rate > 0)) rate = 1.0;  // (NaN too)
+    sound_clock_ = nds_ ? nds_->SetSoundClockRate(rate) : std::clamp(rate, 1.0 / 64, 1.0);
+    return sound_clock_;
 }
 
 int Emu::audio_backlog() const { return nds_->SPU.GetOutputSize(); }

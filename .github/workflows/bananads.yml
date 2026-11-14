@@ -49,6 +49,34 @@ jobs:
           done
       - name: Differential harness (the interpreter against itself must match)
         run: ./build-pc/bananads-difftest --frames 120 --b jit=off stressrom/out/dsstress-L3.nds
+      - name: The sound clock (kms.ff_music, melonDS patch 0500) is exact under the fast paths and slows the sound
+        run: |
+          python3 stressrom/real/build.py
+          python3 bananads/tests/sndbench/build.py bananads/tests/sndbench/out
+          R=stressrom/real/out/dsreal.nds S=bananads/tests/sndbench/out/sndbench.nds
+          # dsreal's ARM7 steps its sequencer on timer 0 and its stream on timer 1, as the SDK's sound driver does:
+          # FastTimers' overflow prediction at a scaled clock must give the timers' every-slice run, frame for frame
+          for c in 0.5 0.25 0.37; do
+            ./build-pc/bananads-difftest --every --frames 300 --a core.sound_clock=$c --a core.fast_timers=off \
+              --b core.sound_clock=$c --b core.fast_timers=on $R
+          done
+          # FastMix's skipping at a scaled clock must give the full mix (sndbench captures the mixers into main RAM)
+          for c in 0.5 0.25 0.37; do
+            ./build-pc/bananads-difftest --every --frames 300 --a core.sound_clock=$c --a core.fast_mix=off \
+              --b core.sound_clock=$c --b core.fast_mix=on $S
+          done
+          # ...and the clock does something: the game's state differs from the hardware clock's
+          if ./build-pc/bananads-difftest --frames 300 --a core.sound_clock=1 --b core.sound_clock=0.5 $R; then
+            echo "core.sound_clock=0.5 changed nothing"; exit 1
+          fi
+          # half the clock, half the sound: the SPU's output over 600 frames
+          mkdir -p sclk
+          for c in 1 0.5; do
+            ./build-pc/bananads --frontend headless --set headless.frames=600 --set headless.audio_dump=sclk/a$c.raw \
+              --set core.sound_clock=$c --set save.dir=sclk --set wifi.dns=off --set resume.on_start=off $S \
+              2>&1 | grep -q '600 frames'
+          done
+          python3 -c "import os,sys; a,b=os.path.getsize('sclk/a1.raw'),os.path.getsize('sclk/a0.5.raw'); r=b/a; print('output at 0.5: %.3f of 1.0' % r); sys.exit(0 if a > 0 and 0.47 < r < 0.53 else 1)"
       - name: aarch64 build
         run: |
           PKG_CONFIG_LIBDIR=/nonexistent cmake -S bananads -B build-a64 \
@@ -59,6 +87,11 @@ jobs:
           qemu-aarch64 -L /usr/aarch64-linux-gnu build-a64/bananads-tests
           qemu-aarch64 -L /usr/aarch64-linux-gnu build-a64/bananads --frontend headless --set headless.frames=120 \
             --set save.dir=smoke --set wifi.dns=off stressrom/out/dsstress-L5.nds 2>&1 | grep '120 frames'
+      - name: The sound clock on the handhelds' path (aarch64, qemu, melonDS's JIT with the fast slice loop)
+        run: |
+          qemu-aarch64 -L /usr/aarch64-linux-gnu build-a64/bananads-difftest --every --frames 200 \
+            --a jit=on --a core.sound_clock=0.25 --a core.fast_timers=off --a core.fast_mix=off \
+            --b jit=on --b core.sound_clock=0.25 --b core.fast_timers=on --b core.fast_mix=on stressrom/real/out/dsreal.nds
       - name: BananaJIT (aarch64, qemu) gives the interpreter's pictures
         run: |
           PKG_CONFIG_LIBDIR=/nonexistent cmake -S bananads -B build-bj \
